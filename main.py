@@ -179,6 +179,7 @@ class SkanerSieci:
 
         # Otwarte okna per-urządzenie (ip -> Toplevel)
         self._okna_urzadzen = {}
+        self._okno_mapy = None
 
         # Baza danych
         self.db = BazaDanych()
@@ -241,6 +242,11 @@ class SkanerSieci:
         tk.Button(p2, text="Wyczyść", command=self._wyczysc,
                   bg="#30363d", fg="#8b949e", font=("Segoe UI", 9),
                   relief=tk.FLAT, padx=10, cursor="hand2").pack(side=tk.LEFT)
+
+        tk.Button(p2, text="Mapa sieci", command=self._pokaz_mape,
+                  bg="#6e40c9", fg="white", font=("Segoe UI", 9, "bold"),
+                  relief=tk.FLAT, padx=12, cursor="hand2",
+                  activebackground="#8957e5").pack(side=tk.LEFT, padx=8)
 
         self.speed_var = tk.StringVar(value="")
         tk.Label(p2, textvariable=self.speed_var, bg="#161b22", fg="#3fb950",
@@ -761,6 +767,178 @@ class SkanerSieci:
 
     def _zamknij_okno(self, ip, okno):
         self._okna_urzadzen.pop(ip, None)
+        try:
+            okno.destroy()
+        except Exception:
+            pass
+
+    # ─── Mapa sieci ───────────────────────────────────────────────────────────
+
+    def _pokaz_mape(self):
+        if not MATPLOTLIB_DOSTEPNE:
+            self._log("Brak matplotlib — pip install matplotlib")
+            return
+
+        # Jeśli okno już otwarte — przenieś na wierzch
+        if self._okno_mapy is not None:
+            try:
+                self._okno_mapy.lift()
+                return
+            except tk.TclError:
+                pass
+
+        okno = tk.Toplevel(self.root)
+        okno.title("Mapa sieci")
+        okno.configure(bg="#0d1117")
+        okno.geometry("860x660")
+        okno.resizable(True, True)
+        self._okno_mapy = okno
+        okno.protocol("WM_DELETE_WINDOW", lambda: self._zamknij_mape(okno))
+
+        # Pasek narzędzi
+        tb = tk.Frame(okno, bg="#161b22", pady=7)
+        tb.pack(fill=tk.X)
+        tk.Label(tb, text="Mapa sieci", font=("Segoe UI", 11, "bold"),
+                 bg="#161b22", fg="#8957e5").pack(side=tk.LEFT, padx=14)
+
+        info_var = tk.StringVar(value="")
+        tk.Label(tb, textvariable=info_var, bg="#161b22", fg="#8b949e",
+                 font=("Segoe UI", 9)).pack(side=tk.RIGHT, padx=14)
+
+        # Figura
+        fig, ax = plt.subplots(figsize=(8, 5.6), dpi=95)
+        fig.patch.set_facecolor("#0d1117")
+
+        canvas = FigureCanvasTkAgg(fig, master=okno)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
+
+        # Pozycje węzłów do obsługi kliknięć
+        node_positions = {}
+
+        def rysuj():
+            ax.cla()
+            ax.set_facecolor("#0d1117")
+            ax.set_aspect("equal")
+            ax.axis("off")
+            node_positions.clear()
+
+            with self._lock:
+                kopia = {ip: dict(dev) for ip, dev in self.urzadzenia.items()}
+
+            if not kopia:
+                ax.text(0, 0, "Brak urzadzen  —  kliknij 'Skanuj siec'",
+                        ha="center", va="center", color="#484f58", fontsize=11)
+                canvas.draw()
+                return
+
+            import math
+            gateway_ip = self.prefix_sieci + ".1"
+            jest_gateway = gateway_ip in kopia
+            pozostale = [ip for ip in kopia if ip != gateway_ip]
+            n = len(pozostale)
+
+            # Pozycje
+            if jest_gateway:
+                node_positions[gateway_ip] = (0.0, 0.0)
+            for i, ip in enumerate(pozostale):
+                angle = (2 * math.pi * i / n) - math.pi / 2 if n > 1 else math.pi / 2
+                node_positions[ip] = (math.cos(angle), math.sin(angle))
+
+            # Linie od gateway do urządzeń
+            gx, gy = node_positions.get(gateway_ip, (0.0, 0.0))
+            for ip, (x, y) in node_positions.items():
+                if ip == gateway_ip:
+                    continue
+                aktywny = kopia[ip].get("aktywny", False)
+                ax.plot([gx, x], [gy, y],
+                        color="#21262d" if aktywny else "#1a1a1a",
+                        linewidth=1.3, zorder=1)
+
+            # Węzły
+            for ip, (x, y) in node_positions.items():
+                dev = kopia.get(ip, {})
+                aktywny = dev.get("aktywny", True if ip == gateway_ip else False)
+                is_me = (ip == self.moj_ip)
+                is_gw = (ip == gateway_ip)
+
+                if is_gw:
+                    kolor, rozmiar, marker = "#f0883e", 420, "D"
+                elif is_me:
+                    kolor, rozmiar, marker = "#3fb950", 260, "s"
+                elif aktywny:
+                    kolor, rozmiar, marker = "#58a6ff", 190, "o"
+                else:
+                    kolor, rozmiar, marker = "#30363d", 100, "o"
+
+                ax.scatter(x, y, c=kolor, s=rozmiar, marker=marker,
+                           zorder=3, edgecolors="#0d1117", linewidths=2)
+
+                # Etykieta
+                if is_gw:
+                    etykieta = f"Gateway\n{ip}"
+                else:
+                    nazwa_db = self.db.pobierz_nazwe(ip)
+                    nazwa_auto = dev.get("nazwa", "")
+                    nazwa = (nazwa_db or
+                             (nazwa_auto if nazwa_auto not in ("Nieznane", "Wykryto", "") else None) or
+                             ip)
+                    etykieta = f"{ip}\n{nazwa}" if nazwa != ip else ip
+
+                dy = -20 if y <= 0.0 else 14
+                ax.annotate(etykieta, (x, y),
+                            textcoords="offset points", xytext=(0, dy),
+                            ha="center", va="top" if y <= 0.0 else "bottom",
+                            fontsize=7, color="#8b949e" if aktywny else "#484f58",
+                            fontfamily="monospace",
+                            bbox=dict(boxstyle="round,pad=0.25", facecolor="#161b22",
+                                      edgecolor="none", alpha=0.75))
+
+            # Legenda
+            ax.legend(
+                handles=[
+                    plt.scatter([], [], c="#f0883e", s=80, marker="D", label="Gateway"),
+                    plt.scatter([], [], c="#3fb950", s=60, marker="s", label="Ten komputer"),
+                    plt.scatter([], [], c="#58a6ff", s=60, marker="o", label="Online"),
+                    plt.scatter([], [], c="#30363d", s=40, marker="o", label="Offline"),
+                ],
+                loc="lower right", fontsize=7, framealpha=0.85,
+                facecolor="#161b22", edgecolor="#30363d", labelcolor="white"
+            )
+
+            ax.set_xlim(-1.55, 1.55)
+            ax.set_ylim(-1.55, 1.55)
+
+            online = sum(1 for d in kopia.values() if d.get("aktywny"))
+            info_var.set(f"{online} online  /  {len(kopia)} lacznie  —  kliknij wezel aby otworzyc szczegoly")
+            canvas.draw()
+
+        # Kliknięcie w węzeł → szczegóły urządzenia
+        def on_click(event):
+            if event.inaxes != ax or event.xdata is None:
+                return
+            for ip, (x, y) in node_positions.items():
+                if ((event.xdata - x) ** 2 + (event.ydata - y) ** 2) ** 0.5 < 0.13:
+                    okno.after(0, lambda a=ip: self._otworz_szczegoly_ip(a))
+                    return
+
+        fig.canvas.mpl_connect("button_press_event", on_click)
+
+        # Przycisk odśwież w toolbar (po stworzeniu canvas, bo potrzebuje rysuj)
+        tk.Button(tb, text="Odswież", command=rysuj,
+                  bg="#238636", fg="white", font=("Segoe UI", 9),
+                  relief=tk.FLAT, padx=10, cursor="hand2").pack(side=tk.LEFT, padx=8)
+
+        rysuj()
+
+        # Auto-odświeżanie co 30 s
+        def auto():
+            if okno.winfo_exists():
+                rysuj()
+                okno.after(30000, auto)
+        okno.after(30000, auto)
+
+    def _zamknij_mape(self, okno):
+        self._okno_mapy = None
         try:
             okno.destroy()
         except Exception:
