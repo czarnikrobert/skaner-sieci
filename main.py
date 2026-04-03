@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, simpledialog
 import threading
 import subprocess
 import socket
@@ -7,6 +7,7 @@ import re
 import time
 import concurrent.futures
 from collections import defaultdict, deque
+from baza import BazaDanych
 
 try:
     import psutil
@@ -179,6 +180,12 @@ class SkanerSieci:
         # Otwarte okna per-urządzenie (ip -> Toplevel)
         self._okna_urzadzen = {}
 
+        # Baza danych
+        self.db = BazaDanych()
+
+        # Poprzedni status urządzeń do wykrywania zmian (ip -> bool online)
+        self._poprzedni_status = {}
+
         self._buduj_ui()
         self._dodaj_siebie()
 
@@ -241,6 +248,15 @@ class SkanerSieci:
 
         tk.Frame(self.root, bg="#30363d", height=1).pack(fill=tk.X)
 
+        # Banner powiadomień (domyślnie ukryty)
+        self._banner = tk.Frame(self.root, bg="#1f4e2e", pady=5)
+        self._banner_label = tk.Label(self._banner, text="", bg="#1f4e2e", fg="#3fb950",
+                                      font=("Segoe UI", 9, "bold"))
+        self._banner_label.pack(side=tk.LEFT, padx=14)
+        tk.Button(self._banner, text="x", bg="#1f4e2e", fg="#3fb950", relief=tk.FLAT,
+                  font=("Segoe UI", 8), cursor="hand2",
+                  command=self._ukryj_banner).pack(side=tk.RIGHT, padx=8)
+
         # Tabela
         glowny = tk.Frame(self.root, bg="#0d1117")
         glowny.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
@@ -275,8 +291,9 @@ class SkanerSieci:
         self.tabela.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Dwuklik → szczegóły portów
+        # Dwuklik → szczegóły / prawy klik → menu
         self.tabela.bind("<Double-1>", self._pokaz_szczegoly)
+        self.tabela.bind("<Button-3>", self._menu_kontekstowe)
 
         # Wykres
         self._buduj_wykres()
@@ -372,9 +389,19 @@ class SkanerSieci:
             self._log(f"ARP: {len(macs)} wpisów")
 
             znalezione = 0
+            nowe_ip = []
             for ip in aktywne:
                 mac = macs.get(ip, "—")
-                nazwa = rozwiaz_nazwe(ip)
+
+                # Sprawdź czy nowe (przed zapisem do DB)
+                if self.db.czy_nowe(ip):
+                    nowe_ip.append(ip)
+
+                # Zapisz do DB i pobierz ewentualną własną nazwę
+                self.db.zapisz_urzadzenie(ip, mac)
+                nazwa_uzytkownika = self.db.pobierz_nazwe(ip)
+                nazwa = nazwa_uzytkownika if nazwa_uzytkownika else rozwiaz_nazwe(ip)
+
                 with self._lock:
                     if ip not in self.urzadzenia:
                         znalezione += 1
@@ -387,10 +414,23 @@ class SkanerSieci:
                         "skanowanie_portow": prev.get("skanowanie_portow", False),
                     }
 
+                # Historia: zapisz zdarzenie online jeśli status się zmienił
+                if self._poprzedni_status.get(ip) is not True:
+                    self.db.dodaj_zdarzenie(ip, "online")
+                self._poprzedni_status[ip] = True
+
             with self._lock:
                 for ip in list(self.urzadzenia.keys()):
                     if ip not in aktywne and ip != self.moj_ip:
                         self.urzadzenia[ip]["aktywny"] = False
+                        # Historia: zapisz zdarzenie offline
+                        if self._poprzedni_status.get(ip) is True:
+                            self.db.dodaj_zdarzenie(ip, "offline")
+                        self._poprzedni_status[ip] = False
+
+            # Powiadom o nowych urządzeniach
+            for ip in nowe_ip:
+                self.root.after(0, lambda a=ip: self._powiadom(a))
 
             self._log(f"Gotowe: {len(self.urzadzenia)} urządzeń (+{znalezione} nowych)")
             self.root.after(0, lambda: self.status_var.set(
@@ -445,8 +485,141 @@ class SkanerSieci:
     def _wyczysc(self):
         with self._lock:
             self.urzadzenia.clear()
+        self._poprzedni_status.clear()
         self._dodaj_siebie()
         self._log("Wyczyszczono")
+
+    # ── Powiadomienia ─────────────────────────────────────────────────────────
+
+    def _powiadom(self, ip: str):
+        info = self.db.pobierz_info(ip)
+        mac = info[0] if info else "—"
+        tekst = f"Nowe urzadzenie w sieci:  {ip}  (MAC: {mac})"
+        self._banner_label.configure(text=tekst)
+        self._banner.pack(fill=tk.X, after=self.root.nametowidget(
+            self.root.winfo_children()[2].winfo_name()  # po separatorze
+        ) if False else self._banner)
+        self._banner.pack(fill=tk.X)
+        self._log(f"[!] Nowe urzadzenie: {ip}  MAC: {mac}")
+        self.root.after(8000, self._ukryj_banner)
+
+    def _ukryj_banner(self):
+        self._banner.pack_forget()
+
+    # ── Menu kontekstowe ──────────────────────────────────────────────────────
+
+    def _menu_kontekstowe(self, event):
+        wiersz = self.tabela.identify_row(event.y)
+        if not wiersz:
+            return
+        self.tabela.selection_set(wiersz)
+        ip = self.tabela.item(wiersz, "values")[0]
+
+        menu = tk.Menu(self.root, tearoff=0, bg="#21262d", fg="white",
+                       activebackground="#1f6feb", activeforeground="white",
+                       relief=tk.FLAT, bd=0)
+        menu.add_command(label=f"  {ip}", state=tk.DISABLED,
+                         font=("Segoe UI", 8))
+        menu.add_separator()
+        menu.add_command(label="  Zmien nazwe",
+                         command=lambda: self._zmien_nazwe(ip))
+        menu.add_command(label="  Historia polaczen",
+                         command=lambda: self._pokaz_historie(ip))
+        menu.add_separator()
+        menu.add_command(label="  Szczegoly i wykres latencji",
+                         command=lambda: self._otworz_szczegoly_ip(ip))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _otworz_szczegoly_ip(self, ip):
+        """Otwiera okno szczegółów bez zdarzenia kliknięcia."""
+        class FakeEvent:
+            pass
+        self.tabela.selection_set(
+            next((w for w in self.tabela.get_children()
+                  if self.tabela.item(w, "values")[0] == ip), "")
+        )
+        self.tabela.focus(
+            next((w for w in self.tabela.get_children()
+                  if self.tabela.item(w, "values")[0] == ip), "")
+        )
+        self._pokaz_szczegoly(FakeEvent())
+
+    # ── Zmiana nazwy ──────────────────────────────────────────────────────────
+
+    def _zmien_nazwe(self, ip: str):
+        aktualna = self.db.pobierz_nazwe(ip) or ""
+        nowa = simpledialog.askstring(
+            "Zmien nazwe",
+            f"Nowa nazwa dla {ip}:",
+            initialvalue=aktualna,
+            parent=self.root,
+        )
+        if nowa is None:
+            return  # anulowano
+        nowa = nowa.strip()
+        self.db.zapisz_nazwe(ip, nowa if nowa else "")
+        with self._lock:
+            if ip in self.urzadzenia:
+                self.urzadzenia[ip]["nazwa"] = nowa if nowa else self.urzadzenia[ip]["nazwa"]
+        self._log(f"Nazwa '{ip}' zmieniona na: {nowa or '(usunieta)'}")
+
+    # ── Historia urządzenia ───────────────────────────────────────────────────
+
+    def _pokaz_historie(self, ip: str):
+        historia = self.db.pobierz_historie(ip, limit=60)
+        info = self.db.pobierz_info(ip)
+
+        okno = tk.Toplevel(self.root)
+        okno.title(f"Historia — {ip}")
+        okno.configure(bg="#0d1117")
+        okno.geometry("480x480")
+        okno.resizable(True, True)
+
+        tk.Label(okno, text=f"Historia polaczen: {ip}",
+                 font=("Consolas", 12, "bold"), bg="#0d1117", fg="#58a6ff").pack(pady=(14, 2))
+
+        if info:
+            _, nazwa_uz, pierwsza, ostatnia = info
+            szczeg = f"Pierwsza wizyta: {pierwsza or '—'}   Ostatnia: {ostatnia or '—'}"
+            tk.Label(okno, text=szczeg, bg="#0d1117", fg="#8b949e",
+                     font=("Segoe UI", 8)).pack()
+
+        tk.Frame(okno, bg="#30363d", height=1).pack(fill=tk.X, pady=8, padx=14)
+
+        if not historia:
+            tk.Label(okno, text="Brak zapisanej historii.",
+                     bg="#0d1117", fg="#484f58", font=("Segoe UI", 10)).pack(pady=20)
+        else:
+            ramka = tk.Frame(okno, bg="#0d1117")
+            ramka.pack(fill=tk.BOTH, expand=True, padx=14)
+
+            scroll = tk.Scrollbar(ramka)
+            scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+            lista = tk.Text(ramka, bg="#161b22", fg="#c9d1d9",
+                            font=("Consolas", 9), relief=tk.FLAT,
+                            state=tk.DISABLED, yscrollcommand=scroll.set)
+            lista.pack(fill=tk.BOTH, expand=True)
+            scroll.configure(command=lista.yview)
+
+            lista.tag_configure("online",  foreground="#3fb950")
+            lista.tag_configure("offline", foreground="#f85149")
+            lista.tag_configure("czas",    foreground="#484f58")
+
+            lista.configure(state=tk.NORMAL)
+            for status, ts in historia:
+                ikona = ">> ONLINE " if status == "online" else "   OFFLINE"
+                tag = "online" if status == "online" else "offline"
+                lista.insert(tk.END, ikona, tag)
+                lista.insert(tk.END, f"   {ts}\n", "czas")
+            lista.configure(state=tk.DISABLED)
+
+        tk.Button(okno, text="Zamknij", command=okno.destroy,
+                  bg="#30363d", fg="white", relief=tk.FLAT, padx=20,
+                  cursor="hand2").pack(pady=10)
 
     def _pokaz_szczegoly(self, event):
         """Popup ze szczegółami i live wykresem latencji po dwukliknięciu wiersza."""
@@ -719,10 +892,13 @@ class SkanerSieci:
             aktywny = dev.get("aktywny", False)
             status = "✓ Online" if aktywny else "Offline"
             tag = "online" if aktywny else "offline"
+            # Własna nazwa z DB ma priorytet
+            nazwa_db = self.db.pobierz_nazwe(ip)
+            nazwa = nazwa_db if nazwa_db else dev.get("nazwa", "—")
             self.tabela.insert("", tk.END, tags=(tag,), values=(
                 ip,
                 dev.get("mac", "—"),
-                dev.get("nazwa", "—"),
+                nazwa,
                 self._formatuj_porty(dev.get("porty"), dev.get("skanowanie_portow", False)),
                 status,
             ))
